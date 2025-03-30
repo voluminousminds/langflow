@@ -1,6 +1,19 @@
-.PHONY: all init format_backend format_frontend format lint build build_frontend install_frontend run_frontend run_backend dev help tests coverage clean_python_cache clean_npm_cache clean_all
+# --- PHONY Targets ---
+.PHONY: all init format_backend format_frontend format lint build build_frontend install_frontend \
+        run_frontend backend debug-backend dev help tests coverage \
+        clean_python_cache clean_npm_cache clean_all setup_uv add \
+        unit_tests unit_tests_looponfail integration_tests integration_tests_no_api_keys \
+        integration_tests_api_keys codespell fix_codespell install_frontendci \
+        install_frontendc run_cli run_cli_debug setup_devcontainer setup_env \
+        frontend frontendc build_and_run build_and_install build build_langflow_base \
+        build_langflow_backup build_langflow docker_build docker_build_backend docker_build_frontend \
+        dockerfile_build dockerfile_build_be dockerfile_build_fe clear_dockerimage \
+        docker_compose_up docker_compose_down dcdev_up lock_base lock_langflow lock \
+        update publish_base publish_langflow publish_base_testpypi publish_langflow_testpypi \
+        publish publish_testpypi alembic-revision alembic-upgrade alembic-downgrade \
+        alembic-current alembic-history alembic-check alembic-stamp locust patch check_tools
 
-# Configurations
+# --- Configurations ---
 VERSION=$(shell grep "^version" pyproject.toml | sed 's/.*\"\(.*\)\"$$/\1/')
 DOCKERFILE=docker/build_and_push.Dockerfile
 DOCKERFILE_BACKEND=docker/build_and_push_backend.Dockerfile
@@ -21,6 +34,8 @@ workers ?= 1
 async ?= true
 lf ?= false
 ff ?= true
+DEBUG_PORT ?= 5678 # Default debugpy port
+
 all: help
 
 ######################
@@ -131,8 +146,6 @@ ifdef base
 	@cd src/backend/base && uv add $(base)
 endif
 
-
-
 ######################
 # CODE TESTS
 ######################
@@ -218,8 +231,12 @@ install_frontendci:
 install_frontendc:
 	@cd src/frontend && $(call CLEAR_DIRS,node_modules) && rm -f package-lock.json && npm install > /dev/null 2>&1
 
-run_frontend: ## run the frontend
-	@-kill -9 `lsof -t -i:3000`
+######################
+# RUNNING LOCALLY
+######################
+
+run_frontend: ## run the frontend in development mode
+	@-kill -9 $$(lsof -t -i:3000) || true
 	@cd src/frontend && npm start $(if $(FRONTEND_START_FLAGS),-- $(FRONTEND_START_FLAGS))
 
 tests_frontend: ## run frontend tests
@@ -239,7 +256,7 @@ run_cli: install_frontend install_backend build_frontend ## run the CLI
 		$(if $(env),--env-file $(env),) \
 		$(if $(filter false,$(open_browser)),--no-open-browser)
 
-run_cli_debug:
+run_cli_debug: ## run the CLI in debug mode (uses 'start' target internally)
 	@echo 'Running the CLI in debug mode'
 	@make install_frontend > /dev/null
 	@echo 'Building the frontend'
@@ -252,25 +269,23 @@ else
 	@make start host=$(host) port=$(port) log_level=debug
 endif
 
-
 setup_devcontainer: ## set up the development container
 	make install_backend
 	make install_frontend
 	make build_frontend
 	uv run langflow --frontend-path src/frontend/build
 
-setup_env: ## set up the environment
+setup_env: ## set up the environment using script
 	@sh ./scripts/setup/setup_env.sh
 
-frontend: install_frontend ## run the frontend in development mode
+frontend: install_frontend ## run the frontend in development mode (alias for run_frontend)
 	make run_frontend
 
-frontendc: install_frontendc
+frontendc: install_frontendc ## clear frontend cache/node_modules and run frontend
 	make run_frontend
-
 
 backend: setup_env install_backend ## run the backend in development mode
-	@-kill -9 $$(lsof -t -i:7860) || true
+	@-kill -9 $$(lsof -t -i:$(port)) || true
 ifdef login
 	@echo "Running backend autologin is $(login)";
 	LANGFLOW_AUTO_LOGIN=$(login) uv run uvicorn \
@@ -292,6 +307,46 @@ else
 		--loop asyncio \
 		$(if $(workers),--workers $(workers),)
 endif
+
+# --- Debug Target ---
+debug-backend: install_backend ## run the backend in debug mode with debugpy
+	@-kill -9 $$(lsof -t -i:$(port)) || true # Kill existing app process
+	@-kill -9 $$(lsof -t -i:$(DEBUG_PORT)) || true # Kill existing debugpy process if any
+	@echo "Starting backend in DEBUG mode (debugpy)..."
+	@echo "  Langflow App Port: $(port)"
+	@echo "  Debugpy Port:      $(DEBUG_PORT)"
+	@echo "  Waiting for debugger client to attach on 0.0.0.0:$(DEBUG_PORT)..."
+ifdef login
+	@echo "Running backend autologin is $(login)";
+	LANGFLOW_AUTO_LOGIN=$(login) uv run python -m debugpy \
+		--listen 0.0.0.0:$(DEBUG_PORT) \
+		--wait-for-client \
+		-m uvicorn \
+		--factory langflow.main:create_app \
+		--host 0.0.0.0 \
+		--port $(port) \
+		# --reload # NOTE: Reload often interferes with debugging, removed here. Manually restart if needed. \
+		--env-file $(env) \
+		--loop asyncio \
+		--workers 1 # NOTE: Debugging is typically done with a single worker process.
+else
+	@echo "Running backend respecting the $(env) file";
+	uv run python -m debugpy \
+		--listen 0.0.0.0:$(DEBUG_PORT) \
+		--wait-for-client \
+		-m uvicorn \
+		--factory langflow.main:create_app \
+		--host 0.0.0.0 \
+		--port $(port) \
+		# --reload # NOTE: Reload often interferes with debugging, removed here. Manually restart if needed. \
+		--env-file $(env) \
+		--loop asyncio \
+		--workers 1 # NOTE: Debugging is typically done with a single worker process.
+endif
+
+######################
+# BUILD AND DEPLOYMENT
+######################
 
 build_and_run: setup_env ## build the project and run it
 	$(call CLEAR_DIRS,dist src/backend/base/dist)
@@ -332,12 +387,11 @@ ifdef restore
 	mv uv.lock.bak uv.lock
 endif
 
-
 docker_build: dockerfile_build clear_dockerimage ## build DockerFile
 
 docker_build_backend: dockerfile_build_be clear_dockerimage ## build Backend DockerFile
 
-docker_build_frontend: dockerfile_build_fe clear_dockerimage ## build Frontend Dockerfile
+docker_build_frontend: dockerfile_build_fe clear_dockerimage ## build Frontend DockerFile
 
 dockerfile_build:
 	@echo 'BUILDING DOCKER IMAGE: ${DOCKERFILE}'
@@ -433,12 +487,14 @@ ifdef main
 	make publish_langflow_testpypi
 endif
 
+######################
+# DATABASE MIGRATIONS (ALEMBIC)
+######################
 
 # example make alembic-revision message="Add user table"
 alembic-revision: ## generate a new migration
 	@echo 'Generating a new Alembic revision'
 	cd src/backend/base/langflow/ && uv run alembic revision --autogenerate -m "$(message)"
-
 
 alembic-upgrade: ## upgrade database to the latest version
 	@echo 'Upgrading database to the latest version'
@@ -465,7 +521,7 @@ alembic-stamp: ## stamp the database with a specific revision
 	cd src/backend/base/langflow/ && uv run alembic stamp $(revision)
 
 ######################
-# LOAD TESTING
+# LOAD TESTING (LOCUST)
 ######################
 
 # Default values for locust configuration
